@@ -1,316 +1,194 @@
-from flask import Flask, request, jsonify, render_template, session
-from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime, timedelta
-import sqlite3
 import re
-import json
-import uuid
-from textblob import TextBlob
-import nltk
-from nltk.tokenize import word_tokenize
-from nltk.corpus import stopwords
-import logging
-from flask_cors import CORS
-app = Flask(__name__)
-CORS(app)
+import torch
+import torch.nn.functional as F
+from transformers import (
+    DistilBertTokenizerFast,
+    DistilBertForSequenceClassification,
+    AutoTokenizer,
+    AutoModel
+)
 
+# ================== LOAD MODELS ==================
 
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
+# Valence model (sentiment)
+sent_tokenizer = DistilBertTokenizerFast.from_pretrained("sentiment_bert")
+sent_model = DistilBertForSequenceClassification.from_pretrained("sentiment_bert")
+sent_model.eval()
 
-try:
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    nltk.download('stopwords')
+# Embedding model (semantic emotion)
+embed_tokenizer = AutoTokenizer.from_pretrained(
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
+embed_model = AutoModel.from_pretrained(
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
+embed_model.eval()
 
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key-change-this'
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///mental_health_chat.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# ================== INTENSITY ==================
 
-db = SQLAlchemy(app)
+PROFANITY = {"fuck", "fucking", "shit", "damn", "hell"}
 
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    session_id = db.Column(db.String(100), unique=True, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    last_active = db.Column(db.DateTime, default=datetime.utcnow)
-    conversations = db.relationship('Conversation', backref='user', lazy=True)
+def detect_intensity(text: str):
+    score = 0
+    t = text.lower()
 
-class Conversation(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    user_message = db.Column(db.Text, nullable=False)
-    bot_response = db.Column(db.Text, nullable=False)
-    sentiment_score = db.Column(db.Float)
-    crisis_detected = db.Column(db.Boolean, default=False)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    if any(p in t for p in PROFANITY):
+        score += 1
+    if "!" in text:
+        score += 1
+    if re.search(r"(very|so|extremely|really)", t):
+        score += 1
 
-class MentalHealthChatbot:
-    def __init__(self):
-        self.crisis_keywords = [
-            'suicide', 'kill myself', 'end my life', 'hurt myself', 
-            'self harm', 'cutting', 'die', 'death', 'overdose',
-            'jump off', 'hang myself', 'worthless', 'hopeless'
-        ]
-        
-        self.emotion_responses = {
-            'anxiety': [
-                "Anxiety can feel overwhelming, but you're not alone. Try the 4-7-8 breathing technique: breathe in for 4, hold for 7, exhale for 8.",
-                "It's normal to feel anxious. Consider grounding techniques: name 5 things you can see, 4 you can touch, 3 you can hear, 2 you can smell, 1 you can taste.",
-                "Anxiety is treatable. Have you considered speaking with a mental health professional? They can provide personalized coping strategies."
-            ],
-            'depression': [
-                "Depression is a real medical condition, and you deserve support. Small steps can make a difference - even getting out of bed is an achievement.",
-                "Your feelings are valid. Depression affects millions of people, and effective treatments are available. Consider reaching out to a therapist or counselor.",
-                "Remember that depression is temporary, even when it doesn't feel that way. Professional help can provide you with tools to manage these feelings."
-            ],
-            'stress': [
-                "Stress is a normal response, but chronic stress needs attention. Try breaking tasks into smaller, manageable pieces.",
-                "Consider stress-management techniques like meditation, exercise, or talking to someone you trust.",
-                "Identifying your stress triggers can help you develop better coping mechanisms. Would you like to explore what's causing your stress?"
-            ],
-            'loneliness': [
-                "Loneliness is a common human experience. Consider joining online communities, volunteering, or reaching out to old friends.",
-                "Even small social interactions can help with loneliness. Try calling a family member or neighbor today.",
-                "Loneliness doesn't mean you're alone forever. There are people who care and want to connect with you."
-            ],
-            'anger': [
-                "Anger is a normal emotion, but it's important to express it healthily. Try counting to 10 or taking deep breaths.",
-                "Physical exercise can be a great outlet for anger. Even a short walk can help clear your mind.",
-                "Consider what's underneath your anger - sometimes it masks hurt, frustration, or fear."
-            ]
-        }
-        
-        self.coping_strategies = {
-            'breathing': "Try the 4-7-8 breathing technique: Inhale for 4 counts, hold for 7, exhale for 8. Repeat 3-4 times.",
-            'grounding': "Use the 5-4-3-2-1 technique: Name 5 things you see, 4 you can touch, 3 you hear, 2 you smell, 1 you taste.",
-            'mindfulness': "Try a 5-minute mindfulness exercise: Focus on your breath, notice thoughts without judgment, gently return attention to breathing.",
-            'exercise': "Physical activity releases endorphins. Even 10 minutes of walking, stretching, or dancing can improve your mood.",
-            'journaling': "Writing down your thoughts can help process emotions. Try writing for 10 minutes without stopping or judging.",
-            'gratitude': "List 3 things you're grateful for today, no matter how small. This can help shift your perspective."
-        }
-        
-        self.professional_resources = {
-            'crisis': {
-                'message': "🚨 If you're having thoughts of self-harm or suicide, please reach out for immediate help:",
-                'resources': [
-                    "National Suicide Prevention Lifeline: 988 (US)",
-                    "Crisis Text Line: Text HOME to 741741",
-                    "International Association for Suicide Prevention: https://www.iasp.info/resources/Crisis_Centres/",
-                    "Emergency Services: 1098 (IND) for your local emergency number"
-                ]
-            },
-            'general': {
-                'message': "Consider connecting with professional mental health support:",
-                'resources': [
-                    "Psychology Today Therapist Directory",
-                    "Your primary care doctor for referrals",
-                    "Employee Assistance Programs (EAP) if available",
-                    "Community mental health centers",
-                    "Online therapy platforms like BetterHelp or Talkspace"
-                ]
-            }
-        }
+    if score >= 2:
+        return "high"
+    elif score == 1:
+        return "medium"
+    else:
+        return "low"
 
-    def analyze_sentiment(self, text):
-        """Analyze sentiment using TextBlob"""
-        blob = TextBlob(text)
+# ================== SEVERITY ==================
 
-        return blob.sentiment.polarity
+DISTRESS_PHRASES = [
+    "i can't do this anymore",
+    "i cant do this anymore",
+    "i'm done",
+    "im done",
+    "i am done",
+    "i don't know how to go on",
+    "i dont know how to go on",
+    "i'm so tired of everything",
+    "im so tired of everything",
+    "i am depressed",
+    "i feel depressed"
+]
 
-    def detect_crisis(self, text):
-        """Detect potential crisis situations"""
-        text_lower = text.lower()
-        return any(keyword in text_lower for keyword in self.crisis_keywords)
+def detect_severity(text: str):
+    t = text.lower()
+    if any(p in t for p in DISTRESS_PHRASES) or "suicidal" in t:
+        return "high"
+    return "normal"
 
-    def extract_emotions(self, text):
-        """Extract emotional keywords from text"""
-        text_lower = text.lower()
-        detected_emotions = []
-        
-        emotion_keywords = {
-            'anxiety': ['anxious', 'worried', 'nervous', 'panic', 'scared', 'fear'],
-            'depression': ['sad', 'depressed', 'down', 'hopeless', 'empty', 'numb'],
-            'stress': ['stressed', 'overwhelmed', 'pressure', 'burden', 'exhausted'],
-            'loneliness': ['lonely', 'alone', 'isolated', 'disconnected', 'abandoned'],
-            'anger': ['angry', 'mad', 'furious', 'irritated', 'frustrated', 'rage']
-        }
-        
-        for emotion, keywords in emotion_keywords.items():
-            if any(keyword in text_lower for keyword in keywords):
-                detected_emotions.append(emotion)
-        
-        return detected_emotions
+# ================== FIRST-PERSON OVERRIDES ==================
 
-    def generate_response(self, user_message, conversation_history=None):
-        """Generate contextual response based on user message and history"""
-        # Crisis detection first
-        if self.detect_crisis(user_message):
-            return self.handle_crisis()
-        
-        # Extract emotions
-        emotions = self.extract_emotions(user_message)
-        
-        # Generate response based on detected emotions
-        if emotions:
-            primary_emotion = emotions[0]
-            responses = self.emotion_responses.get(primary_emotion, [])
-            if responses:
-                import random
-                base_response = random.choice(responses)
-                
-                # Add coping strategy
-                if 'technique' in user_message.lower() or 'help' in user_message.lower():
-                    strategy_key = random.choice(list(self.coping_strategies.keys()))
-                    base_response += f"\n\n💡 Here's a technique you can try: {self.coping_strategies[strategy_key]}"
-                
-                return base_response
-        
-    
-        if any(word in user_message.lower() for word in ['technique', 'strategy', 'cope', 'help']):
-            import random
-            strategy_key = random.choice(list(self.coping_strategies.keys()))
-            return f"Here's a coping strategy that might help: {self.coping_strategies[strategy_key]}"
-        
-    
-        return self.get_supportive_response(user_message)
+FIRST_PERSON_EMOTIONS = {
+    "i am sad": "sadness",
+    "i feel sad": "sadness",
+    "i'm sad": "sadness",
+    "im sad": "sadness"
+}
 
-    def handle_crisis(self):
-        """Handle crisis situations with immediate resources"""
-        crisis_info = self.professional_resources['crisis']
-        response = crisis_info['message'] + "\n\n"
-        response += "\n".join(f"• {resource}" for resource in crisis_info['resources'])
-        response += "\n\nYou matter, and there are people who want to help you through this difficult time."
-        return response
+# ================== EMBEDDINGS ==================
 
-    def get_supportive_response(self, message):
-        """Generate general supportive response"""
-        supportive_responses = [
-            "Thank you for sharing that with me. Your feelings are valid, and it takes courage to reach out.",
-            "I hear you, and I want you to know that you're not alone in feeling this way.",
-            "It sounds like you're going through a difficult time. Remember that seeking help is a sign of strength.",
-            "Your mental health matters. Have you considered talking to a professional who can provide personalized support?",
-            "It's okay to not be okay sometimes. What's one small thing you could do for yourself today?",
-            "You've taken an important step by talking about how you're feeling. That shows real self-awareness."
-        ]
-        
-        import random
-        base_response = random.choice(supportive_responses)
-        
-        # Add professional help suggestion
-        if random.random() < 0.3:  # 30% chance
-            general_info = self.professional_resources['general']
-            base_response += f"\n\n{general_info['message']}\n"
-            base_response += "\n".join(f"• {resource}" for resource in general_info['resources'][:2])
-        
-        return base_response
+def get_embedding(text):
+    inputs = embed_tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        padding=True
+    )
+    with torch.no_grad():
+        outputs = embed_model(**inputs)
+    return outputs.last_hidden_state.mean(dim=1)
 
+# ================== EMOTION PROTOTYPES ==================
 
-chatbot = MentalHealthChatbot()
+EMOTION_PROTOTYPES = {
+    "sadness": "I feel sad, low, and down",
+    "hopelessness": "I feel empty and see no way forward",
+    "distress": "I feel overwhelmed and unable to cope",
+    "anxiety": "I feel worried and tense about what might happen",
+    "loneliness": "I feel alone and disconnected",
+    "anger": "I feel angry, irritated, and frustrated",
+    "relief": "I feel lighter and can breathe again",
+    "gratitude": "I feel thankful and appreciative"
+}
 
+EMOTION_VALENCE = {
+    "sadness": "negative",
+    "hopelessness": "negative",
+    "distress": "negative",
+    "anxiety": "negative",
+    "loneliness": "negative",
+    "anger": "negative",
+    "relief": "positive",
+    "gratitude": "positive"
+}
 
-@app.route('/')
-def index():
-    return render_template('test.html')
+# ================== EMOTION DETECTION ==================
 
-@app.route('/chat', methods=['POST'])
-def chat():
-    try:
-        data = request.get_json()
-        user_message = data.get('message', '').strip()
-        
-        if not user_message:
-            return jsonify({'error': 'Message cannot be empty'}), 400
-        
-        # Get or create user session
-        session_id = session.get('session_id')
-        if not session_id:
-            session_id = str(uuid.uuid4())
-            session['session_id'] = session_id
-            
-            user = User(session_id=session_id)
-            db.session.add(user)
-            db.session.commit()
-        else:
-            user = User.query.filter_by(session_id=session_id).first()
-            if user:
-                user.last_active = datetime.utcnow()
-                db.session.commit()
-        
-        
-        recent_conversations = Conversation.query.filter_by(user_id=user.id)\
-            .order_by(Conversation.timestamp.desc()).limit(5).all()
-        
-        sentiment_score = chatbot.analyze_sentiment(user_message)
-        
-        
-        crisis_detected = chatbot.detect_crisis(user_message)
-        
-        
-        bot_response = chatbot.generate_response(user_message, recent_conversations)
-        
-       
-        conversation = Conversation(
-            user_id=user.id,
-            user_message=user_message,
-            bot_response=bot_response,
-            sentiment_score=sentiment_score,
-            crisis_detected=crisis_detected
-        )
-        db.session.add(conversation)
-        db.session.commit()
-        
-        return jsonify({
-            'reply': bot_response,
-            'sentiment': sentiment_score,
-            'crisis_detected': crisis_detected,
-            'timestamp': datetime.utcnow().isoformat()
-        })
-        
-    except Exception as e:
-        app.logger.error(f"Error in chat endpoint: {str(e)}")
-        return jsonify({'error': 'An error occurred processing your message'}), 500
+def detect_emotion(text: str, intensity: str):
+    text_emb = get_embedding(text)
 
-@app.route('/history')
-def get_history():
-    session_id = session.get('session_id')
-    if not session_id:
-        return jsonify([])
-    
-    user = User.query.filter_by(session_id=session_id).first()
-    if not user:
-        return jsonify([])
-    
-    conversations = Conversation.query.filter_by(user_id=user.id)\
-        .order_by(Conversation.timestamp.asc()).all()
-    
-    history = []
-    for conv in conversations:
-        history.append({
-            'user_message': conv.user_message,
-            'bot_response': conv.bot_response,
-            'timestamp': conv.timestamp.isoformat(),
-            'sentiment': conv.sentiment_score
-        })
-    
-    return jsonify(history)
+    scores = {}
+    for emotion, proto in EMOTION_PROTOTYPES.items():
+        proto_emb = get_embedding(proto)
+        score = F.cosine_similarity(text_emb, proto_emb).item()
+        scores[emotion] = score
 
-@app.route('/resources')
-def get_resources():
-    return jsonify({
-        'crisis': chatbot.professional_resources['crisis'],
-        'general': chatbot.professional_resources['general'],
-        'coping_strategies': chatbot.coping_strategies
-    })
+    best_emotion, best_score = max(scores.items(), key=lambda x: x[1])
 
+    if best_score < 0.35:
+        return "uncertain"
 
-def create_tables():
-    db.create_all()
+    # Guardrail: flat language should not become anger
+    if best_emotion == "anger" and intensity == "low":
+        return "sadness"
 
-if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    return best_emotion
+
+# ================== MAIN ANALYSIS ==================
+
+def analyze_text(text: str):
+    t = text.lower()
+
+    # ----- Valence -----
+    inputs = sent_tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        padding=True
+    )
+
+    with torch.no_grad():
+        logits = sent_model(**inputs).logits
+
+    probs = torch.softmax(logits, dim=1)[0]
+    neg, pos = probs.tolist()
+
+    if pos > 0.6:
+        valence = "positive"
+        confidence = pos
+    elif neg > 0.6:
+        valence = "negative"
+        confidence = neg
+    else:
+        valence = "mixed"
+        confidence = max(pos, neg)
+
+    intensity = detect_intensity(text)
+    severity = detect_severity(text)
+
+    # ----- FIRST-PERSON OVERRIDE (HIGHEST PRIORITY) -----
+    emotion = None
+    for phrase, emo in FIRST_PERSON_EMOTIONS.items():
+        if phrase in t:
+            emotion = emo
+            valence = "negative"   # override IMDb bias
+            break
+
+    # ----- FALLBACK TO SEMANTIC DETECTION -----
+    if emotion is None:
+        emotion = detect_emotion(text, intensity)
+
+    # ----- EMOTION–VALENCE CONSISTENCY -----
+    if emotion in EMOTION_VALENCE:
+        if EMOTION_VALENCE[emotion] != valence:
+            emotion = "uncertain"
+
+    return {
+        "valence": valence,
+        "emotion": emotion,
+        "intensity": intensity,
+        "severity": severity,
+        "confidence": round(confidence, 2)
+    }
